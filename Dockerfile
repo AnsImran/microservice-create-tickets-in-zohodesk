@@ -30,6 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
 
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 COPY src/ ./src/
 

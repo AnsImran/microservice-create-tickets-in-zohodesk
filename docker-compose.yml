@@ -1,5 +1,6 @@
 services:
   ticket-service:
+    image: ghcr.io/ansimran/microservice-create-tickets-in-zohodesk:latest
     build:
       context: .
       args:
@@ -7,8 +8,12 @@ services:
         VERSION: "${VERSION:-0.1.0}"
     container_name: ticket-service
     env_file: .env
+    environment:
+      ZOHO_TOKEN_SERVICE_URL: http://token-service:8000/v1/token
     ports:
-      - "127.0.0.1:8100:8100"
+      - "127.0.0.1:8200:8100"
+    networks:
+      - zoho-token-service_default
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8100/v1/healthz"]
@@ -16,3 +21,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+networks:
+  zoho-token-service_default:
+    external: true

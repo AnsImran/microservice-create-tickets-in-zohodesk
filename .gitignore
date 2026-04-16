@@ -13,6 +13,9 @@ venv/
 # Environment (contains org ID and secrets)
 .env
 
+# Credentials (SSH keys, tokens)
+credentials/
+
 # IDE
 .idea/
 .vscode/
