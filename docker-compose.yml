@@ -1,0 +1,18 @@
+services:
+  ticket-service:
+    build:
+      context: .
+      args:
+        BUILD_DATE: "${BUILD_DATE:-unknown}"
+        VERSION: "${VERSION:-0.1.0}"
+    container_name: ticket-service
+    env_file: .env
+    ports:
+      - "127.0.0.1:8100:8100"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8100/v1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

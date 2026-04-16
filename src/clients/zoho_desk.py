@@ -8,12 +8,16 @@ from typing import Any
 
 import httpx
 
-from src.app.config import ENV_PATH, settings
+from src.app.config import ENV_PATH, get_settings
 from src.clients.token_client import get_access_token
 from src.schemas.tickets import TicketRequest, TicketResponse
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
 class ProductNotFoundError(Exception):
     """Raised when a product name cannot be resolved to an ID."""
@@ -33,6 +37,8 @@ class ZohoDeskError(Exception):
 # ---------------------------------------------------------------------------
 
 def _desk_headers(token: str) -> dict[str, str]:
+    """Build the standard header set for every Zoho Desk API call."""
+    settings = get_settings()
     return {
         "Authorization": f"Zoho-oauthtoken {token}",
         "orgId": settings.zoho_desk_org_id,
@@ -46,7 +52,11 @@ def _desk_headers(token: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def _read_product_map() -> dict[str, str]:
-    """Parse PRODUCT_MAP from the .env file on disk."""
+    """Parse ``PRODUCT_MAP`` from the ``.env`` file on disk.
+
+    Reading from disk (not process memory) means hand-edits to ``.env``
+    are picked up on the next request without restarting the service.
+    """
     if not ENV_PATH.exists():
         return {}
     text = ENV_PATH.read_text(encoding="utf-8")
@@ -67,12 +77,9 @@ def _read_product_map() -> dict[str, str]:
 
 
 def _append_to_product_map(name: str, product_id: str) -> None:
-    """Append a new name:id pair to PRODUCT_MAP in the .env file."""
+    """Append a new ``name:id`` pair to ``PRODUCT_MAP`` in the ``.env`` file."""
     if not ENV_PATH.exists():
-        ENV_PATH.write_text(
-            f'PRODUCT_MAP="{name}:{product_id}"\n',
-            encoding="utf-8",
-        )
+        ENV_PATH.write_text(f'PRODUCT_MAP="{name}:{product_id}"\n', encoding="utf-8")
         return
 
     text = ENV_PATH.read_text(encoding="utf-8")
@@ -89,29 +96,32 @@ def _append_to_product_map(name: str, product_id: str) -> None:
     logger.info("Persisted new product mapping: %s -> %s", name, product_id)
 
 
-async def _fetch_products_from_api(token: str) -> dict[str, str]:
-    """GET /api/v1/products from Zoho Desk and return {name: id} map."""
+async def _fetch_products_from_api(client: httpx.AsyncClient, token: str) -> dict[str, str]:
+    """``GET /api/v1/products`` from Zoho Desk and return ``{name: id}`` map."""
+    settings = get_settings()
     url = f"{settings.zoho_desk_base}/api/v1/products"
-    async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
-        resp = await client.get(url, headers=_desk_headers(token), params={"limit": 100})
-        resp.raise_for_status()
+    resp = await client.get(url, headers=_desk_headers(token), params={"limit": 100})
+    resp.raise_for_status()
     data = resp.json().get("data", [])
     return {item["productName"]: item["id"] for item in data if "productName" in item and "id" in item}
 
 
-async def resolve_product_id(token: str, product_name: str) -> str:
+async def resolve_product_id(client: httpx.AsyncClient, token: str, product_name: str) -> str:
     """Resolve a human-readable product name to its Zoho product ID.
 
-    1. Look up in the .env PRODUCT_MAP (0 API calls).
-    2. On miss, fetch from Zoho API, persist to .env, and return.
-    3. If still not found, raise ProductNotFoundError.
+    Resolution order
+    ----------------
+    1. **Local file lookup** — read ``PRODUCT_MAP`` from ``.env`` (0 API calls).
+    2. **Zoho API fallback** — ``GET /api/v1/products``, then persist the new
+       mapping back to ``.env`` so future lookups are instant.
+    3. **Not found** — raise :class:`ProductNotFoundError`.
     """
     local_map = _read_product_map()
     if product_name in local_map:
         return local_map[product_name]
 
     logger.info("Product '%s' not in local map — fetching from Zoho API", product_name)
-    api_map = await _fetch_products_from_api(token)
+    api_map = await _fetch_products_from_api(client, token)
     if product_name in api_map:
         _append_to_product_map(product_name, api_map[product_name])
         return api_map[product_name]
@@ -123,22 +133,41 @@ async def resolve_product_id(token: str, product_name: str) -> str:
 # Ticket creation
 # ---------------------------------------------------------------------------
 
-async def create_ticket(req: TicketRequest) -> TicketResponse:
-    """Create a Zoho Desk ticket and return the essential response fields."""
+async def create_ticket(client: httpx.AsyncClient, req: TicketRequest) -> TicketResponse:
+    """Create a Zoho Desk ticket and return the essential response fields.
 
-    # Resolve department.
+    Parameters
+    ----------
+    client:
+        Shared async HTTP client (created in the FastAPI lifespan).
+    req:
+        Validated ticket-creation request.
+
+    Raises
+    ------
+    ValueError
+        If ``departmentId`` cannot be resolved.
+    ProductNotFoundError
+        If ``productName`` cannot be resolved to an ID.
+    ZohoDeskError
+        If the Zoho Desk API returns a non-2xx response.
+    """
+    settings = get_settings()
+
+    # -- Resolve department --
     department_id = req.departmentId or settings.zoho_desk_default_department_id
     if not department_id:
         raise ValueError("departmentId is required (pass it in the request or set ZOHO_DESK_DEFAULT_DEPARTMENT_ID)")
 
-    token = await get_access_token()
+    # -- Get access token --
+    token = await get_access_token(client, settings.zoho_token_service_url)
 
-    # Resolve product.
+    # -- Resolve product --
     product_id = req.productId
     if not product_id and req.productName:
-        product_id = await resolve_product_id(token, req.productName)
+        product_id = await resolve_product_id(client, token, req.productName)
 
-    # Build Zoho payload from non-None request fields.
+    # -- Build Zoho payload --
     payload: dict[str, Any] = {
         "subject": req.subject,
         "description": req.description,
@@ -154,10 +183,9 @@ async def create_ticket(req: TicketRequest) -> TicketResponse:
     if req.extra:
         payload.update(req.extra)
 
-    # POST to Zoho Desk.
+    # -- POST to Zoho Desk --
     url = f"{settings.zoho_desk_base}/api/v1/tickets"
-    async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
-        resp = await client.post(url, headers=_desk_headers(token), json=payload)
+    resp = await client.post(url, headers=_desk_headers(token), json=payload)
 
     if not resp.is_success:
         raise ZohoDeskError(resp.status_code, resp.text)
