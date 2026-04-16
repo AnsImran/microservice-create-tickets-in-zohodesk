@@ -38,6 +38,6 @@ COPY src/ ./src/
 USER appuser
 EXPOSE 8100
 
-# --workers 1 is intentional: the service writes to .env (PRODUCT_MAP)
+# --workers 1 is intentional: the service writes to product_map.json
 # and multiple workers would race on that file.
 CMD ["uvicorn", "src.app.main:app", "--host", "0.0.0.0", "--port", "8100", "--workers", "1"]

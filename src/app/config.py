@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 ENV_PATH: Path = Path(__file__).resolve().parents[2] / ".env"
+PRODUCT_MAP_PATH: Path = Path(__file__).resolve().parents[2] / "product_map.json"
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
@@ -47,16 +48,6 @@ class Settings(BaseSettings):
         default="",
         description="Fallback Zoho department ID used when the request does not supply one.",
         examples=["1166045000000006907"],
-    )
-
-    # --- Product map ---------------------------------------------------
-    product_map: str = Field(
-        default="",
-        description=(
-            "Comma-separated 'name:id' pairs that map human-readable product names "
-            "to Zoho product IDs. Queried before hitting the Zoho API."
-        ),
-        examples=["Code Stroke Alert:1166045000001146278,Amendments:1166045000001146306"],
     )
 
     # --- HTTP ----------------------------------------------------------

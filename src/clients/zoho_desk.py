@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
-import re
 from typing import Any
 
 import httpx
 
-from src.app.config import ENV_PATH, get_settings
+from src.app.config import PRODUCT_MAP_PATH, get_settings
 from src.clients.token_client import get_access_token
 from src.schemas.tickets import TicketRequest, TicketResponse
 
@@ -52,47 +52,28 @@ def _desk_headers(token: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def _read_product_map() -> dict[str, str]:
-    """Parse ``PRODUCT_MAP`` from the ``.env`` file on disk.
+    """Read the product name-to-ID map from ``product_map.json``.
 
-    Reading from disk (not process memory) means hand-edits to ``.env``
+    Reading from disk (not process memory) means hand-edits to the file
     are picked up on the next request without restarting the service.
     """
-    if not ENV_PATH.exists():
+    if not PRODUCT_MAP_PATH.exists():
         return {}
-    text = ENV_PATH.read_text(encoding="utf-8")
-    match = re.search(r'^PRODUCT_MAP\s*=\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
-    if not match:
+    try:
+        return json.loads(PRODUCT_MAP_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Could not read %s: %s", PRODUCT_MAP_PATH, exc)
         return {}
-    raw = match.group(1)
-    product_map: dict[str, str] = {}
-    for pair in raw.split(","):
-        pair = pair.strip()
-        if ":" not in pair:
-            continue
-        name, _, pid = pair.rpartition(":")
-        name, pid = name.strip(), pid.strip()
-        if name and pid:
-            product_map[name] = pid
-    return product_map
 
 
-def _append_to_product_map(name: str, product_id: str) -> None:
-    """Append a new ``name:id`` pair to ``PRODUCT_MAP`` in the ``.env`` file."""
-    if not ENV_PATH.exists():
-        ENV_PATH.write_text(f'PRODUCT_MAP="{name}:{product_id}"\n', encoding="utf-8")
-        return
-
-    text = ENV_PATH.read_text(encoding="utf-8")
-    pattern = re.compile(r'^(PRODUCT_MAP\s*=\s*["\']?)(.+?)(["\']?\s*)$', re.MULTILINE)
-    match = pattern.search(text)
-    if match:
-        prefix, existing, suffix = match.group(1), match.group(2), match.group(3)
-        updated = f"{existing},{name}:{product_id}"
-        text = text[: match.start()] + prefix + updated + suffix + text[match.end() :]
-    else:
-        text = text.rstrip("\n") + f'\nPRODUCT_MAP="{name}:{product_id}"\n'
-
-    ENV_PATH.write_text(text, encoding="utf-8")
+def _save_product_map(name: str, product_id: str) -> None:
+    """Add a new mapping to ``product_map.json`` and write the file back."""
+    existing = _read_product_map()
+    existing[name] = product_id
+    PRODUCT_MAP_PATH.write_text(
+        json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     logger.info("Persisted new product mapping: %s -> %s", name, product_id)
 
 
@@ -106,27 +87,99 @@ async def _fetch_products_from_api(client: httpx.AsyncClient, token: str) -> dic
     return {item["productName"]: item["id"] for item in data if "productName" in item and "id" in item}
 
 
+def _ci_lookup(mapping: dict[str, str], key: str) -> str | None:
+    """Case-insensitive lookup — returns the value if *key* matches any map key, else ``None``."""
+    key_lower = key.lower()
+    for stored_name, stored_id in mapping.items():
+        if stored_name.lower() == key_lower:
+            return stored_id
+    return None
+
+
 async def resolve_product_id(client: httpx.AsyncClient, token: str, product_name: str) -> str:
     """Resolve a human-readable product name to its Zoho product ID.
 
     Resolution order
     ----------------
-    1. **Local file lookup** — read ``PRODUCT_MAP`` from ``.env`` (0 API calls).
+    1. **Local file lookup** — read ``product_map.json`` (0 API calls).
     2. **Zoho API fallback** — ``GET /api/v1/products``, then persist the new
-       mapping back to ``.env`` so future lookups are instant.
+       mapping back to ``product_map.json`` so future lookups are instant.
     3. **Not found** — raise :class:`ProductNotFoundError`.
     """
     local_map = _read_product_map()
-    if product_name in local_map:
-        return local_map[product_name]
+    local_hit = _ci_lookup(local_map, product_name)
+    if local_hit:
+        return local_hit
 
     logger.info("Product '%s' not in local map — fetching from Zoho API", product_name)
     api_map = await _fetch_products_from_api(client, token)
-    if product_name in api_map:
-        _append_to_product_map(product_name, api_map[product_name])
-        return api_map[product_name]
+    api_hit = _ci_lookup(api_map, product_name)
+    if api_hit:
+        _save_product_map(product_name, api_hit)
+        return api_hit
 
     raise ProductNotFoundError(f"Product '{product_name}' not found in Zoho Desk")
+
+
+async def resolve_product_ids_batch(
+    client: httpx.AsyncClient,
+    token: str,
+    product_names: list[str],
+) -> tuple[dict[str, str], list[str]]:
+    """Resolve a list of product names to Zoho product IDs in one pass.
+
+    Returns ``(resolved, not_found)`` where *resolved* maps each name to
+    its ID and *not_found* lists names that could not be resolved.
+
+    Resolution order
+    ----------------
+    1. **Local file lookup** — read ``product_map.json`` (0 API calls).
+    2. **Zoho Products API** — ``GET /api/v1/products`` for any remaining
+       names.  Newly discovered mappings are persisted to ``product_map.json``.
+    3. Names still unresolved go into *not_found*.
+
+    The call never raises for missing products — *not_found* is the
+    communication channel.  If the Zoho API itself fails, all pending
+    names land in *not_found* and the error is logged.
+    """
+    resolved: dict[str, str] = {}
+    pending: list[str] = []
+
+    # -- Tier 1: local file lookup (zero API calls) --
+    local_map = _read_product_map()
+    for name in product_names:
+        local_hit = _ci_lookup(local_map, name)
+        if local_hit:
+            resolved[name] = local_hit
+        else:
+            pending.append(name)
+
+    if not pending:
+        return resolved, []
+
+    # -- Tier 2: single Zoho Products API call for all remaining names --
+    logger.info("Batch resolve: %d name(s) not in local map — fetching from Zoho API", len(pending))
+    try:
+        api_map = await _fetch_products_from_api(client, token)
+    except Exception:
+        logger.error(
+            "Zoho Products API call failed — %d name(s) will be reported as not_found",
+            len(pending),
+            exc_info=True,
+        )
+        return resolved, pending
+
+    not_found: list[str] = []
+    for name in pending:
+        api_hit = _ci_lookup(api_map, name)
+        if api_hit:
+            resolved[name] = api_hit
+            _save_product_map(name, api_hit)
+        else:
+            logger.warning("Product '%s' not found in Zoho products API", name)
+            not_found.append(name)
+
+    return resolved, not_found
 
 
 # ---------------------------------------------------------------------------

@@ -11,10 +11,16 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from src.clients.token_client import TokenServiceError, get_access_token
-from src.clients.zoho_desk import ProductNotFoundError, ZohoDeskError, create_ticket
+from src.clients.zoho_desk import ProductNotFoundError, ZohoDeskError, create_ticket, resolve_product_ids_batch
 from src.core.logging_config import setup_logging
 from src.core.middleware import RequestLoggingMiddleware
-from src.schemas.tickets import ErrorResponse, TicketRequest, TicketResponse
+from src.schemas.tickets import (
+    ErrorResponse,
+    ProductResolveRequest,
+    ProductResolveResponse,
+    TicketRequest,
+    TicketResponse,
+)
 
 from .config import get_settings
 
@@ -146,6 +152,30 @@ async def _unhandled_error(request: Request, exc: Exception) -> JSONResponse:
 async def post_create_ticket(req: TicketRequest) -> TicketResponse:
     """Accept a ticket payload, resolve product & department, and create the ticket in Zoho Desk."""
     return await create_ticket(get_http_client(), req)
+
+
+@app.post(
+    "/v1/products/resolve",
+    response_model=ProductResolveResponse,
+    tags=["Products"],
+    summary="Resolve product names to Zoho product IDs",
+    responses={
+        503: {"model": ErrorResponse, "description": "Token service unreachable."},
+    },
+)
+async def post_resolve_products(req: ProductResolveRequest) -> ProductResolveResponse:
+    """Accept a list of product names and return their Zoho product IDs.
+
+    Names found in the local ``PRODUCT_MAP`` are returned instantly.
+    Unknown names trigger a single Zoho Products API call; newly
+    discovered mappings are persisted to ``.env`` for future lookups.
+    Names that cannot be resolved appear in the ``not_found`` list.
+    """
+    settings = get_settings()
+    client = get_http_client()
+    token = await get_access_token(client, settings.zoho_token_service_url)
+    resolved, not_found = await resolve_product_ids_batch(client, token, req.product_names)
+    return ProductResolveResponse(resolved=resolved, not_found=not_found)
 
 
 @app.get("/v1/healthz", tags=["Health"], summary="Liveness probe")

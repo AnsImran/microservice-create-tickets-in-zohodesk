@@ -10,6 +10,8 @@ services:
     env_file: .env
     environment:
       ZOHO_TOKEN_SERVICE_URL: http://token-service:8000/v1/token
+    volumes:
+      - ./product_map.json:/app/product_map.json
     ports:
       - "127.0.0.1:8200:8100"
     networks:

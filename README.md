@@ -21,36 +21,34 @@ graph TB
 
     subgraph "src/app/"
         MAIN["main.py<br/><b>FastAPI app</b><br/>Routes + exception handlers"]:::app
-        CONFIG["config.py<br/><b>Settings</b><br/>ENV_PATH, settings singleton"]:::config
+        CONFIG["config.py<br/><b>Settings</b><br/>ENV_PATH, PRODUCT_MAP_PATH,<br/>settings singleton"]:::config
     end
 
     subgraph "src/schemas/"
-        TICKETS["tickets.py<br/><b>ContactModel</b><br/><b>TicketRequest</b><br/><b>TicketResponse</b>"]:::schema
+        TICKETS["tickets.py<br/><b>ContactModel</b><br/><b>TicketRequest / TicketResponse</b><br/><b>ProductResolveRequest</b><br/><b>ProductResolveResponse</b>"]:::schema
     end
 
     subgraph "src/clients/"
         TOKEN["token_client.py<br/><b>get_access_token()</b><br/><b>TokenServiceError</b>"]:::client
-        ZOHO["zoho_desk.py<br/><b>create_ticket()</b><br/><b>resolve_product_id()</b><br/><b>ZohoDeskError</b><br/><b>ProductNotFoundError</b>"]:::client
+        ZOHO["zoho_desk.py<br/><b>create_ticket()</b><br/><b>resolve_product_id()</b><br/><b>resolve_product_ids_batch()</b><br/><b>ZohoDeskError</b><br/><b>ProductNotFoundError</b>"]:::client
     end
 
-    ENV[".env file<br/>PRODUCT_MAP, ORG_ID, ..."]:::config
+    PMAP["product_map.json<br/>name-to-ID cache"]:::config
     TOKEN_SVC["zoho_token_service<br/><i>:8000</i>"]:::external
     ZOHO_API["Zoho Desk API<br/><i>desk.zoho.com</i>"]:::external
 
     UVICORN -->|"loads"| MAIN
-    MAIN -->|"imports create_ticket"| ZOHO
+    MAIN -->|"imports create_ticket,<br/>resolve_product_ids_batch"| ZOHO
     MAIN -->|"imports get_access_token,<br/>TokenServiceError"| TOKEN
-    MAIN -->|"imports TicketRequest,<br/>TicketResponse"| TICKETS
+    MAIN -->|"imports TicketRequest,<br/>TicketResponse,<br/>ProductResolve*"| TICKETS
     MAIN -->|"imports settings"| CONFIG
 
     ZOHO -->|"imports get_access_token"| TOKEN
     ZOHO -->|"imports TicketRequest,<br/>TicketResponse"| TICKETS
-    ZOHO -->|"imports settings,<br/>ENV_PATH"| CONFIG
-    ZOHO -.->|"reads/writes<br/>PRODUCT_MAP"| ENV
+    ZOHO -->|"imports settings,<br/>PRODUCT_MAP_PATH"| CONFIG
+    ZOHO -.->|"reads/writes"| PMAP
 
     TOKEN -->|"imports settings"| CONFIG
-
-    CONFIG -.->|"reads at startup"| ENV
 
     TOKEN -.->|"GET /v1/token"| TOKEN_SVC
     ZOHO -.->|"POST /api/v1/tickets<br/>GET /api/v1/products"| ZOHO_API
@@ -67,7 +65,7 @@ sequenceDiagram
     participant Caller as Caller<br/>(Stroke Workflow)
     participant Main as src/app/main.py<br/>FastAPI Router
     participant ZohoDesk as src/clients/zoho_desk.py<br/>create_ticket()
-    participant ProdMap as .env file<br/>PRODUCT_MAP
+    participant ProdMap as product_map.json
     participant ZohoAPI_P as Zoho Desk API<br/>/api/v1/products
     participant TokenClient as src/clients/token_client.py<br/>get_access_token()
     participant TokenSvc as zoho_token_service<br/>:8000
@@ -96,19 +94,19 @@ sequenceDiagram
     end
 
     rect rgb(243, 229, 245)
-        Note over ZohoDesk,ZohoAPI_P: 4. Resolve Product ID
+        Note over ZohoDesk,ZohoAPI_P: 4. Resolve Product ID (case-insensitive)
         alt productId provided in request
             ZohoDesk->>ZohoDesk: Use productId directly
         else productName provided
-            ZohoDesk->>+ProdMap: Read PRODUCT_MAP from .env
+            ZohoDesk->>+ProdMap: Read product_map.json
             ProdMap-->>-ZohoDesk: { name: id, ... }
-            alt Found in local map
+            alt Found in local map (case-insensitive)
                 ZohoDesk->>ZohoDesk: Return cached productId<br/>(0 API calls)
             else Not in local map
                 ZohoDesk->>+ZohoAPI_P: GET /api/v1/products?limit=100
                 ZohoAPI_P-->>-ZohoDesk: [ { productName, id }, ... ]
-                alt Found in API response
-                    ZohoDesk->>ProdMap: Append new name:id<br/>to PRODUCT_MAP in .env
+                alt Found in API response (case-insensitive)
+                    ZohoDesk->>ProdMap: Write new entry<br/>to product_map.json
                     ZohoDesk->>ZohoDesk: Return productId
                 else Not found anywhere
                     ZohoDesk-->>Main: raise ProductNotFoundError
@@ -163,6 +161,7 @@ flowchart LR
 
 ```bash
 cp .env.example .env
+cp product_map.json.example product_map.json
 # Fill in ZOHO_DESK_ORG_ID (required) and ZOHO_DESK_DEFAULT_DEPARTMENT_ID (optional)
 uv sync
 ```
@@ -185,7 +184,6 @@ Interactive docs at `http://127.0.0.1:8100/docs`.
 | `ZOHO_DESK_DEFAULT_DEPARTMENT_ID` | No | -- | Fallback department ID if not provided in request |
 | `HTTP_TIMEOUT_SECONDS` | No | `30` | Timeout for outgoing HTTP calls |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
-| `PRODUCT_MAP` | No | -- | Comma-separated `name:id` pairs for product resolution |
 
 ## API
 
@@ -213,7 +211,7 @@ curl -X POST http://127.0.0.1:8100/v1/tickets \
 | `contact` | object | Yes | Must include `lastName`; optional `firstName`, `email`, `phone` |
 | `departmentId` | string | No | Falls back to `ZOHO_DESK_DEFAULT_DEPARTMENT_ID` |
 | `productId` | string | No | Zoho product ID (preferred -- skips lookup) |
-| `productName` | string | No | Human-readable name -- resolved to `productId` via `PRODUCT_MAP` or Zoho API |
+| `productName` | string | No | Human-readable name -- resolved via `product_map.json` or Zoho API (case-insensitive) |
 | `channel` | string | No | e.g. `"Phone"`, `"Email"`, `"SMS"` |
 | `priority` | string | No | e.g. `"High"`, `"Low"` |
 | `status` | string | No | e.g. `"Open"`, `"Escalated"` |
@@ -235,6 +233,38 @@ curl -X POST http://127.0.0.1:8100/v1/tickets \
 }
 ```
 
+### `POST /v1/products/resolve`
+
+Resolve one or more product names to their Zoho product IDs in a single call.
+
+```bash
+curl -X POST http://127.0.0.1:8100/v1/products/resolve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "product_names": ["Code Stroke Alert", "Super Stat", "Bogus Product"]
+  }'
+```
+
+**Request body:**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `product_names` | string[] | Yes | One or more product names to resolve (min 1) |
+
+**Response:**
+
+```json
+{
+  "resolved": {
+    "Code Stroke Alert": "1166045000001146278",
+    "Super Stat": "1166045000005037001"
+  },
+  "not_found": ["Bogus Product"]
+}
+```
+
+The endpoint never fails for unknown names -- they appear in `not_found` instead. If the Zoho Products API itself is unreachable, all unresolved names go into `not_found` and the error is logged server-side.
+
 ### `GET /v1/healthz`
 
 Returns `{"status": "ok"}`.
@@ -245,10 +275,19 @@ Checks connectivity to the token service. Returns 200 or 503.
 
 ## Product Resolution
 
-The `PRODUCT_MAP` in `.env` stores a local `name:id` mapping so most requests resolve products with **zero API calls**:
+Product name-to-ID mappings are stored in `product_map.json`:
 
-```
-PRODUCT_MAP="Code Stroke Alert:1166045000001146278,Amendments:1166045000001146306,..."
+```json
+{
+  "Code Stroke Alert": "1166045000001146278",
+  "Amendments": "1166045000001146306"
+}
 ```
 
-If a `productName` is not found in the local map, the service fetches the full product list from `GET /api/v1/products`, resolves the ID, and **auto-appends** the new mapping to `.env` so future requests are instant. You can also hand-edit `.env` at any time -- changes are picked up on the next request without restarting.
+**Resolution strategy (all lookups are case-insensitive):**
+
+1. **Local cache** -- read `product_map.json`. If the name matches (any casing), return the ID immediately with zero API calls.
+2. **Zoho API fallback** -- if not found locally, fetch the full product list from `GET /api/v1/products`. If the name matches, **auto-persist** the new mapping to `product_map.json` so future lookups are instant.
+3. **Not found** -- raise `ProductNotFoundError` (422) for single lookups, or add to `not_found` list for batch lookups.
+
+You can hand-edit `product_map.json` at any time -- changes are picked up on the next request without restarting.

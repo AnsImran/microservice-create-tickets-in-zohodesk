@@ -188,3 +188,36 @@ class ErrorResponse(BaseModel):
         description="Correlation ID for request tracing (echoed from X-Request-ID header).",
         examples=["a1b2c3d4-e5f6-7890-abcd-ef1234567890"],
     )
+
+
+# ---------------------------------------------------------------------------
+# Product resolution
+# ---------------------------------------------------------------------------
+
+
+class ProductResolveRequest(BaseModel):
+    """Payload accepted by ``POST /v1/products/resolve``."""
+
+    product_names: list[str] = Field(
+        ...,
+        min_length=1,
+        description="One or more human-readable product names to resolve to Zoho product IDs.",
+        examples=[["Code Stroke Alert", "Amendments", "SUPER STAT"]],
+    )
+
+    model_config = {"str_strip_whitespace": True}
+
+
+class ProductResolveResponse(BaseModel):
+    """Payload returned by ``POST /v1/products/resolve``."""
+
+    resolved: dict[str, str] = Field(
+        ...,
+        description="Mapping of product name to Zoho product ID for each successfully resolved name.",
+        examples=[{"Code Stroke Alert": "1166045000001146278", "Amendments": "1166045000001146306"}],
+    )
+    not_found: list[str] = Field(
+        ...,
+        description="Product names that could not be resolved via local cache or Zoho API.",
+        examples=[["Nonexistent Product"]],
+    )
