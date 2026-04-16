@@ -1,0 +1,13 @@
+[project]
+name = "microservice-create-zoho-desk-ticket"
+version = "0.1.0"
+description = "Microservice that creates Zoho Desk tickets via the Zoho Desk API."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "pydantic-settings",
+    "python-dotenv",
+]
