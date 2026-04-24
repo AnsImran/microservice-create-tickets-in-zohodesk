@@ -9,6 +9,7 @@ from typing import AsyncIterator
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from src.clients.token_client import TokenServiceError, get_access_token
 from src.clients.zoho_desk import ProductNotFoundError, ZohoDeskError, create_ticket, resolve_product_ids_batch
@@ -201,3 +202,16 @@ async def readyz():
             status_code=503,
             content=ErrorResponse(detail=str(exc)).model_dump(),
         )
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics (§38)
+# ---------------------------------------------------------------------------
+Instrumentator(
+    excluded_handlers=[
+        "/metrics",
+        ".*/health.*",
+        ".*/healthz",
+        ".*/readyz",
+    ],
+).instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)

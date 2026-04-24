@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
+import os
 from datetime import UTC, datetime
+from pathlib import Path
 
 
 class JSONFormatter(logging.Formatter):
@@ -40,12 +43,21 @@ def setup_logging(*, level: str = "INFO", fmt: str = "json") -> None:
     for handler in root.handlers[:]:
         root.removeHandler(handler)
 
+    formatter: logging.Formatter = JSONFormatter() if fmt == "json" else logging.Formatter(TEXT_FORMAT)
     handler = logging.StreamHandler()
-    if fmt == "json":
-        handler.setFormatter(JSONFormatter())
-    else:
-        handler.setFormatter(logging.Formatter(TEXT_FORMAT))
+    handler.setFormatter(formatter)
     root.addHandler(handler)
+
+    # Phase-2 observability: when WLS_LOG_FILE is set, also write to a
+    # rotating file so Promtail can tail it and ship to Loki.
+    file_path = os.environ.get("WLS_LOG_FILE")
+    if file_path:
+        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            file_path, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
 
     # Quiet noisy third-party loggers.
     logging.getLogger("httpx").setLevel(logging.WARNING)
