@@ -291,3 +291,22 @@ Product name-to-ID mappings are stored in `product_map.json`:
 3. **Not found** -- raise `ProductNotFoundError` (422) for single lookups, or add to `not_found` list for batch lookups.
 
 You can hand-edit `product_map.json` at any time -- changes are picked up on the next request without restarting.
+
+## Deployment & observability (EC2)
+
+Production runs as a Docker container on a single EC2 host, deployed by GitHub Actions, observed by a shared Prometheus + Grafana + Tempo + Loki stack. (Local dev still works via the Setup / Run instructions above.)
+
+### Containerization
+- **`Dockerfile`** -- `python:3.12-slim`; dependencies installed with `uv sync --frozen --no-dev --no-install-project` from `pyproject.toml` + `uv.lock` (eliminates dep drift between local / CI / prod -- this replaced an earlier hand-curated `pip install` list that silently went stale when new deps were added). The `CMD` is wrapped with `opentelemetry-instrument`, which is inert unless the `OTEL_*` env vars are set, so the image runs fine standalone.
+- **`docker-compose.yml`** references the CI-built GHCR image **`ghcr.io/ansimran/microservice-create-tickets-in-zohodesk:latest`** with a `build:` block kept as a local fallback.
+- **`.dockerignore`** keeps secrets, tests, docs and the `.github/` folder out of the build context.
+
+### CI/CD -- `.github/workflows/ci.yml`
+On push to `main`: **test** (lint/compile/pytest) -> **build-and-push** (image -> GHCR, registry-cached) -> **deploy** (SSH to EC2, `git reset --hard origin/main`, `docker login ghcr.io`, `docker compose pull`, `docker compose up -d`, health-check). Required GitHub Actions secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`, `GHCR_USER`, `GHCR_TOKEN` (plus `DEPLOY_GIT_PATH` where used). Docs-only pushes are skipped via `paths-ignore`.
+
+### EC2 topology
+The container joins an external Docker network **`observability-net`** so services resolve each other by container name and Prometheus can scrape them. An EC2-side **`docker-compose.override.yml`** (gitignored, not in this repo) injects the `OTEL_*` env vars + a `WLS_LOG_FILE` path and joins that network; the committed compose stays environment-agnostic. This service's container name on EC2 is **`ticket-service`**, internal port **8100**. (Note: on EC2 its host-port mapping currently squats on **8200** -- a known pre-existing misconfig -- but inter-service traffic uses Docker DNS so it does not matter operationally.)
+
+### Observability
+- **Phase 1 -- metrics:** `/metrics` exposed via `prometheus-fastapi-instrumentator`; Prometheus scrapes it (scrape job / `OTEL_SERVICE_NAME`: **`create-ticket`**).
+- **Phase 2 -- traces + logs:** the `opentelemetry-instrument` CMD wrapper auto-instruments FastAPI + httpx and ships spans via OTLP to the OTel Collector -> **Tempo**. JSON logs go to `WLS_LOG_FILE`, tailed by **Promtail** into **Loki**; `OTEL_PYTHON_LOG_CORRELATION=true` injects `otelTraceID` so Grafana jumps trace <-> log. The explicit OTel instrumentor packages (`opentelemetry-instrumentation-fastapi`/`-httpx`/`-logging`) are pinned in `pyproject.toml` because uv-created venvs ship without `pip`, so the usual `opentelemetry-bootstrap -a install` step silently no-ops.
